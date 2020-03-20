@@ -129,3 +129,29 @@ def moment_update(model, model_ema, m):
 
 class MyHelpFormatter(argparse.MetavarTypeHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
     pass
+
+class InfoMaxLoss(torch.nn.Module):
+    def __init__(self, gamma):
+        super(InfoMaxLoss, self).__init__()
+        self.gamma = gamma
+        self.eps = 1e-10
+
+    def forward(self, p):
+        p0 = p.mean(0)
+        out = (p0 * p0.add(1e-10).log()).sum() * self.gamma - (p * p.add(1e-10).log()).sum(1).mean(0)
+        return out
+
+class DataIter(object):
+    def __init__(self, data_loader):
+        self.data_loader = data_loader
+        self._data_iter = None
+        self.counter = 0
+
+    @property
+    def next_batch(self):
+        if self.counter % len(self.data_loader) == 0:
+            self.data_loader.sampler.set_epoch(self.counter//len(self.data_loader))
+            self._data_iter = iter(self.data_loader)
+
+        data, label = next(self._data_iter)
+        return data, label

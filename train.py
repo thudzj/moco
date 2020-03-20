@@ -3,6 +3,18 @@ Code for MoCo pre-training
 
 MoCo: Momentum Contrast for Unsupervised Visual Representation Learning
 
+baseline:
+python -m torch.distributed.launch --master_port 12347 --nproc_per_node=8 train.py --nce-k 65536 --k_shot 1 --beta 0. --amp-opt-level O1
+[03/17 02:36:39 moco]: Train: [200][1220/1251]  T 1.027 (1.153) DT 0.000 (0.170)        loss 0.747 (0.882)      loss2 -1.705 (-1.640)     prob 0.567 (0.547)
+[03/17 02:36:51 moco]: Train: [200][1230/1251]  T 1.035 (1.153) DT 0.000 (0.170)        loss 0.689 (0.882)      loss2 -1.606 (-1.640)     prob 0.600 (0.547)
+[03/17 02:37:02 moco]: Train: [200][1240/1251]  T 1.077 (1.153) DT 0.000 (0.170)        loss 1.061 (0.882)      loss2 -1.690 (-1.640)     prob 0.508 (0.547)
+[03/17 02:37:12 moco]: Train: [200][1250/1251]  T 0.769 (1.151) DT 0.000 (0.170)        loss 0.828 (0.882)      loss2 -1.642 (-1.640)     prob 0.562 (0.547)
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -m torch.distributed.launch --nproc_per_node=4 eval.py --pretrained-model ../output/imagenet/K65536/current.pth
+[03/18 10:01:45 moco]: Test: [180/196]  Time 0.289 (0.187)      Loss 1.6299 (1.7186)    Acc@1 58.594% (60.344%) Acc@5 85.156% (83.117%)
+[03/18 10:01:46 moco]: Test: [190/196]  Time 0.091 (0.187)      Loss 1.4217 (1.7111)    Acc@1 64.062% (60.471%) Acc@5 89.844% (83.213%)
+[03/18 10:01:47 moco]:  * Acc@1 60.698% Acc@5 83.340%
+
 """
 import argparse
 import os
@@ -19,10 +31,10 @@ from torchvision import transforms
 
 
 from moco.NCE import MemoryMoCo, NCESoftmaxLoss
-from moco.dataset import ImageFolderInstance
+from moco.dataset import ImageFolderInstance, KShotImageFolderInstance, SelectedImageFolderInstance
 from moco.logger import setup_logger
 from moco.models.resnet import resnet50
-from moco.util import AverageMeter, MyHelpFormatter, DistributedShufle, set_bn_train, moment_update
+from moco.util import AverageMeter, MyHelpFormatter, DistributedShufle, set_bn_train, moment_update, InfoMaxLoss, DataIter
 from moco.lr_scheduler import get_scheduler
 
 try:
@@ -36,7 +48,7 @@ def parse_option():
     parser = argparse.ArgumentParser('moco training', formatter_class=MyHelpFormatter)
 
     # dataset
-    parser.add_argument('--data-dir', type=str, required=True, help='root director of dataset')
+    parser.add_argument('--data-dir', type=str, default='/data/LargeData/ImageNet', help='root director of dataset')
     parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet100', 'imagenet'],
                         help='dataset to training')
     parser.add_argument('--crop', type=float, default=0.08, help='minimum crop')
@@ -75,11 +87,18 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
     parser.add_argument('--save-freq', type=int, default=10, help='save frequency')
-    parser.add_argument('--output-dir', type=str, default='./output', help='output director')
+    parser.add_argument('--output-dir', type=str, default='../output/imagenet/K65536', help='output director')
 
     # misc
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument("--rng-seed", type=int, default=0, help='manual seed')
+
+    # add
+    parser.add_argument('--k_shot', type=int, default=0, help='K shot')
+    parser.add_argument('--beta', type=float, default=0.)
+    parser.add_argument('--gamma', type=float, default=1.)
+    parser.add_argument('--info-t', type=float, default=0.07)
+    parser.add_argument('--batch-size-labeled', type=int, default=2, help='batch_size_labeled')
 
     args = parser.parse_args()
 
@@ -122,7 +141,18 @@ def get_loader(args):
         num_workers=args.num_workers, pin_memory=True,
         sampler=train_sampler, drop_last=True)
 
-    return train_loader
+    if args.k_shot > 0:
+        train_dataset_labeled = SelectedImageFolderInstance(train_folder, args.k_shot, transform=train_transform)
+        train_sampler_labeled = torch.utils.data.distributed.DistributedSampler(train_dataset_labeled)
+        train_loader_labeled = torch.utils.data.DataLoader(
+            train_dataset_labeled, batch_size=args.batch_size_labeled, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+            sampler=train_sampler_labeled, drop_last=False)
+        train_iter_labeled = DataIter(train_loader_labeled)
+    else:
+        train_iter_labeled = None
+
+    return train_loader, train_iter_labeled
 
 
 def build_model(args):
@@ -173,13 +203,15 @@ def save_checkpoint(args, epoch, model, model_ema, contrast, optimizer, schedule
 
 
 def main(args):
-    train_loader = get_loader(args)
+    train_loader, train_iter_labeled = get_loader(args)
+    num_classes = 1000 if args.dataset == 'imagenet' else 100
     n_data = len(train_loader.dataset)
     logger.info(f"length of training dataset: {n_data}")
 
     model, model_ema = build_model(args)
-    contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
+    contrast = MemoryMoCo(args.batch_size, 128, args.nce_k, args.nce_t, num_classes, args.k_shot, args.info_t).cuda()
     criterion = NCESoftmaxLoss().cuda()
+    criterion2 = InfoMaxLoss(args.gamma).cuda()
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.batch_size * dist.get_world_size() / 256 * args.base_learning_rate,
                                 momentum=args.momentum,
@@ -213,7 +245,7 @@ def main(args):
         train_loader.sampler.set_epoch(epoch)
 
         tic = time.time()
-        loss, prob = train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args)
+        loss, prob = train_moco(epoch, train_loader, train_iter_labeled, model, model_ema, contrast, criterion, criterion2, optimizer, scheduler, args)
 
         logger.info('epoch {}, total time {:.2f}'.format(epoch, time.time() - tic))
 
@@ -228,7 +260,7 @@ def main(args):
             save_checkpoint(args, epoch, model, model_ema, contrast, scheduler, optimizer)
 
 
-def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args):
+def train_moco(epoch, train_loader, train_iter_labeled, model, model_ema, contrast, criterion, criterion2, optimizer, scheduler, args):
     """
     one epoch training for moco
     """
@@ -238,13 +270,15 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
     batch_time = AverageMeter()
     data_time = AverageMeter()
     loss_meter = AverageMeter()
+    loss2_meter = AverageMeter()
     prob_meter = AverageMeter()
 
     end = time.time()
-    for idx, (inputs, _,) in enumerate(train_loader):
+    for idx, (inputs, _) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
         bsz = inputs.size(0)
+        assert(bsz == args.batch_size)
 
         # forward
         x1, x2 = torch.split(inputs, [3, 3], dim=1)
@@ -253,14 +287,30 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
         x1 = x1.cuda(non_blocking=True)
         x2 = x2.cuda(non_blocking=True)
 
+        if args.k_shot > 0:
+            x2_labeled, buffer_idx = train_iter_labeled.next_batch
+            x2_labeled = x2_labeled.cuda(non_blocking=True)
+            buffer_idx = buffer_idx.cuda(non_blocking=True)
+            x2_all = torch.cat([x2, x2_labeled], 0)
+        else:
+            x2_all = x2
+
         feat_q = model(x1)
         with torch.no_grad():
-            x2_shuffled, backward_inds = DistributedShufle.forward_shuffle(x2, epoch)
+            x2_shuffled, backward_inds = DistributedShufle.forward_shuffle(x2_all, epoch)
             feat_k = model_ema(x2_shuffled)
             feat_k_all, feat_k = DistributedShufle.backward_shuffle(feat_k, backward_inds, return_local=True)
 
-        out = contrast(feat_q, feat_k, feat_k_all)
-        loss = criterion(out)
+        if args.k_shot > 0:
+            out, out2 = contrast(feat_q, feat_k, feat_k_all, buffer_idx)
+            loss_raw = criterion(out)
+            loss2 = criterion2(out2)
+            loss = loss_raw + args.beta * loss2
+        else:
+            out = contrast(feat_q, feat_k, feat_k_all, buffer_idx)
+            loss_raw = criterion(out)
+            loss2 = torch.cuda.FloatTensor([0.])
+            loss = loss_raw
         prob = F.softmax(out, dim=1)[:, 0].mean()
 
         # backward
@@ -277,7 +327,8 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
         moment_update(model, model_ema, args.alpha)
 
         # update meters
-        loss_meter.update(loss.item(), bsz)
+        loss_meter.update(loss_raw.item(), bsz)
+        loss2_meter.update(loss2.item(), bsz)
         prob_meter.update(prob.item(), bsz)
         batch_time.update(time.time() - end)
         end = time.time()
@@ -288,6 +339,7 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
                         f'T {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                         f'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
                         f'loss {loss_meter.val:.3f} ({loss_meter.avg:.3f})\t'
+                        f'loss2 {loss2_meter.val:.3f} ({loss2_meter.avg:.3f})\t'
                         f'prob {prob_meter.val:.3f} ({prob_meter.avg:.3f})')
 
     return loss_meter.avg, prob_meter.avg

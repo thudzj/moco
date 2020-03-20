@@ -32,7 +32,7 @@ def parse_option():
     parser = argparse.ArgumentParser('moco eval', formatter_class=MyHelpFormatter)
 
     # dataset
-    parser.add_argument('--data-dir', type=str, required=True, help='root director of dataset')
+    parser.add_argument('--data-dir', type=str, default='/data/LargeData/ImageNet', help='root director of dataset')
     parser.add_argument('--dataset', type=str, default='imagenet',
                         choices=['imagenet', 'imagenet100'], help='dataset name')
     parser.add_argument('--crop', type=float, default=0.08, help='minimum crop')
@@ -67,7 +67,7 @@ def parse_option():
     parser.add_argument('--pretrained-model', type=str, required=True, help="pretrained model path")
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
-    parser.add_argument('--output-dir', type=str, default='./output', help='root director for output')
+    parser.add_argument('--output-dir', type=str, default='../output/imagenet/K65536/eval', help='root director for output')
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
     parser.add_argument('--save-freq', type=int, default=5, help='save frequency')
 
